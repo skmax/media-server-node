@@ -287,12 +287,52 @@ public:
 		RTPSession::SetSendingRTPMap(rtp,apt);
 		RTPSession::SetReceivingRTPMap(rtp,apt);
 		
+		//Set properties
+		RTPSession::SetProperties(properties.GetChildren("properties"));
+		
 		//Call parent
 		return RTPSession::Init();
 	}
 };
 
+class MP4RecorderFacade :
+	public MP4Recorder,
+	public MP4Recorder::Listener
+{
+public:
+	MP4RecorderFacade(v8::Handle<v8::Object> object) :
+		MP4Recorder(this)
+	{
+		persistent = std::make_shared<Persistent<v8::Object>>(object);
+	}
 
+	void onFirstFrame(QWORD time) override
+	{
+		//Run function on main node thread
+		MediaServer::Async([=,cloned=persistent](){
+			Nan::HandleScope scope;
+			int i = 0;
+			v8::Local<v8::Value> argv[1];
+			//Create local args
+			argv[i++] = Nan::New<v8::Uint32>((uint32_t)time);
+			//Call object method with arguments
+			MakeCallback(cloned, "onstarted", i, argv);
+		});
+	}
+	void onClosed() override 
+	{
+		//Run function on main node thread
+		MediaServer::Async([=,cloned=persistent](){
+			Nan::HandleScope scope;
+			int i = 0;
+			v8::Local<v8::Value> argv[0];
+			//Call object method with arguments
+			MakeCallback(cloned, "onclosed", i, argv);
+		});
+	}
+private:
+	std::shared_ptr<Persistent<v8::Object>> persistent;
+};
 
 class PlayerFacade :
 	public MP4Streamer,
@@ -313,23 +353,28 @@ public:
 		
 	virtual void onRTPPacket(RTPPacket &packet)
 	{
-		switch(packet.GetMedia())
+		//Clone packet
+		auto cloned = packet.Clone();
+		//Copy payload
+		cloned->AdquireMediaData();
+		//Check media type
+		switch(cloned->GetMediaType())
 		{
 			case MediaFrame::Video:
 				//Update stats
-				video.media.Update(getTimeMS(),packet.GetSeqNum(),packet.GetRTPHeader().GetSize()+packet.GetMediaLength());
+				video.media.Update(getTimeMS(),cloned->GetSeqNum(),cloned->GetRTPHeader().GetSize()+cloned->GetMediaLength());
 				//Set ssrc of video
-				packet.SetSSRC(video.media.ssrc);
+				cloned->SetSSRC(video.media.ssrc);
 				//Multiplex
-				video.AddPacket(packet.Clone(),0);
+				video.AddPacket(cloned,0);
 				break;
 			case MediaFrame::Audio:
 				//Update stats
-				audio.media.Update(getTimeMS(),packet.GetSeqNum(),packet.GetRTPHeader().GetSize()+packet.GetMediaLength());
+				audio.media.Update(getTimeMS(),cloned->GetSeqNum(),cloned->GetRTPHeader().GetSize()+cloned->GetMediaLength());
 				//Set ssrc of audio
-				packet.SetSSRC(audio.media.ssrc);
+				cloned->SetSSRC(audio.media.ssrc);
 				//Multiplex
-				audio.AddPacket(packet.Clone(),0);
+				audio.AddPacket(cloned,0);
 				break;
 			default:
 				///Ignore
@@ -513,7 +558,7 @@ public:
 			//Delete depacketier
 			delete(depacketizer);
 	}
-
+	
 	virtual void onRTP(RTPIncomingMediaStream* group,const RTPPacket::shared& packet)
 	{
 		//Do not do extra work if there are no listeners
@@ -543,14 +588,12 @@ public:
 		 if (frame)
 		 {
 			 //Call all listeners
-			 for (Listeners::const_iterator it = listeners.begin();it!=listeners.end();++it)
+			 for (const auto& listener : listeners)
 				 //Call listener
-				 (*it)->onMediaFrame(packet->GetSSRC(),*frame);
+				 listener->onMediaFrame(packet->GetSSRC(),*frame);
 			 //Next
 			 depacketizer->ResetFrame();
 		 }
-		
-			
 	}
 	
 	virtual void onBye(RTPIncomingMediaStream* group) 
@@ -568,14 +611,29 @@ public:
 	
 	void AddMediaListener(MediaFrame::Listener *listener)
 	{
-		//Add to set
-		listeners.insert(listener);
+		//If already stopped
+		if (!incomingSource || !listener)
+			//Done
+			return;
+		//Add listener async
+		incomingSource->GetTimeService().Async([=](...){
+			//Add to set
+			listeners.insert(listener);
+		});
 	}
 	
 	void RemoveMediaListener(MediaFrame::Listener *listener)
 	{
-		//Remove from set
-		listeners.erase(listener);
+		//If already stopped
+		if (!incomingSource)
+			//Done
+			return;
+		
+		//Add listener sync so it can be deleted after this call
+		incomingSource->GetTimeService().Sync([=](...){
+			//Remove from set
+			listeners.erase(listener);
+		});
 	}
 	
 	void Stop()
@@ -592,9 +650,7 @@ public:
 	}
 	
 private:
-	typedef std::set<MediaFrame::Listener*> Listeners;
-private:
-	Listeners listeners;
+	std::set<MediaFrame::Listener*> listeners;
 	RTPDepacketizer* depacketizer;
 	RTPIncomingMediaStream* incomingSource;
 };
@@ -883,6 +939,7 @@ struct RTPSource
 	DWORD totalBytes;
 	DWORD totalRTCPBytes;
 	DWORD bitrate;
+	DWORD clockrate;
 };
 
 struct RTPIncomingSource : public RTPSource
@@ -897,6 +954,8 @@ struct RTPIncomingSource : public RTPSource
 	QWORD lastReport;
 	DWORD totalPLIs;
 	DWORD totalNACKs;
+	int64_t skew;
+	double  drift;
 	
 	%extend 
 	{
@@ -1190,25 +1249,25 @@ class StreamTrackDepacketizer
 {
 public:
 	StreamTrackDepacketizer(RTPIncomingMediaStream* incomingSource);
-	//SWIG doesn't support inner classes, so specializing it here, it will be casted internally later
+
 	void AddMediaListener(MediaFrameListener* listener);
 	void RemoveMediaListener(MediaFrameListener* listener);
 	void Stop();
 };
 
-class MP4Recorder :
+class MP4RecorderFacade :
 	public MediaFrameListener
 {
 public:
-	MP4Recorder();
-	virtual ~MP4Recorder();
+	MP4RecorderFacade(v8::Handle<v8::Object> object);
 
 	//Recorder interface
 	virtual bool Create(const char *filename);
-	virtual bool Record();
-	virtual bool Record(bool waitVideo);
+		bool Record(bool waitVideo, bool disableHints);
 	virtual bool Stop();
 	virtual bool Close();
+	void SetTimeShiftDuration(DWORD duration);
+	bool SetH264ParameterSets(const std::string& sprops);
 	bool Close(bool async);
 };
 
